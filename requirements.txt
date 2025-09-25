@@ -1,0 +1,13 @@
+brainflow
+numpy
+scipy
+mne
+pandas
+scikit-learn
+joblib
+pydantic
+fastapi
+uvicorn
+httpx
+openai
+plotly
