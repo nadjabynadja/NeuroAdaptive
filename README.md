@@ -1,4 +1,4 @@
-# NeuralReader Neuroadaptive Loop
+# NeuroAdaptive
 
 This prototype implements a real-time brain-AI loop that uses EEG signals to adapt large language model (LLM) responses to the user's cognitive state. It targets consumer EEG headsets (Muse, OpenBCI) via the BrainFlow SDK and includes a simulator so the stack runs without hardware.
 
