@@ -71,14 +71,68 @@ class LLMOrchestrator:
         return content
 
     def _fallback_response(self) -> str:
-        history = "\n".join(f"{m.role}: {m.content}" for m in self._conversation.messages[-4:])
-        directive = self._directive.system_instruction if self._directive else ""
-        return (
-            "[stubbed-response] Following directive: "
-            + directive
-            + " | Recent messages: "
-            + history
+        """Return a directive-aware stub response that demonstrates the adaptation.
+
+        Adapts verbosity and tone to the active directive so the demo audience
+        can see the injection working even without a live LLM API key.
+        """
+        if self._directive is None:
+            return "[NEUROADAPTIVE STUB] No directive set."
+
+        meta = self._directive.metadata
+        verb = self._directive.verbosity_label
+        tone = self._directive.tone_label
+        load_pct = int(float(meta.get("load", 0.5)) * 100)
+        level = str(meta.get("load_level", "medium"))
+        conf_pct = int(float(meta.get("confidence", 0.0)) * 100)
+
+        user_msgs = [m for m in self._conversation.messages if m.role == "user"]
+        topic = user_msgs[-1].content[:80] if user_msgs else "your question"
+
+        header = (
+            f"[NEUROADAPTIVE STUB | load={level} ({load_pct}%) | "
+            f"verbosity={verb} | tone={tone} | conf={conf_pct}%]\n"
         )
+
+        if verb == "low":
+            # High cognitive load → terse bullets, reassuring language
+            body = (
+                f"Key points on: '{topic[:60]}'\n\n"
+                f"• Directive active: {self._directive.system_instruction}\n"
+                f"• Response compressed — elevated cognitive load detected.\n"
+                f"• Core answer: this stub demonstrates high-load brevity.\n\n"
+                f"Take a moment; we can expand any point when you're ready."
+            )
+        elif verb == "high":
+            # Low cognitive load → verbose, step-by-step, exploratory framing
+            body = (
+                f"Directive active: {self._directive.system_instruction}\n\n"
+                f"Your EEG profile shows low cognitive load (alpha-dominant, "
+                f"low theta-beta ratio) — the system switches to high-verbosity mode "
+                f"and provides step-by-step reasoning.\n\n"
+                f"On your question — '{topic[:70]}' —\n\n"
+                f"Step 1: Context.  The neuroadaptive loop infers that you have "
+                f"available working memory and are in an exploratory cognitive state.\n\n"
+                f"Step 2: Mechanism.  The directive above is prepended to the LLM "
+                f"system prompt before every API call, shaping response depth and tone "
+                f"in real time without any explicit user instruction.\n\n"
+                f"Step 3: Why it matters.  This stub replaces the live LLM call; in "
+                f"production the same directive would instruct the model to deliver a "
+                f"detailed, example-rich answer matched to your current capacity."
+            )
+        else:
+            # Medium load → balanced paragraph, collaborative tone
+            body = (
+                f"Directive active: {self._directive.system_instruction}\n\n"
+                f"Responding to '{topic[:70]}' at balanced verbosity "
+                f"(moderate cognitive load, {level} level).\n\n"
+                f"The EEG-derived context adjusts both response depth and tone. "
+                f"In production this placeholder is replaced by an actual LLM call "
+                f"with the directive injected as the system prompt — the model then "
+                f"tailors verbosity, examples, and pacing to your real-time neural state."
+            )
+
+        return header + "\n" + body
 
     def reset(self) -> None:
         self._conversation = ConversationContext()

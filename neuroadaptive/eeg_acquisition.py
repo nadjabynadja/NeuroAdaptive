@@ -26,6 +26,58 @@ class EEGFrame:
 
 
 class EEGReader:
+    """Async EEG producer.  In simulator mode it synthesises physiologically-
+    grounded oscillations (fixed initial phases per channel, mode-switchable
+    frequencies) so that downstream spectral features are meaningful.
+    """
+
+    # Each mode is a physiologically-motivated combination of dominant
+    # frequencies.  The heuristic cognitive model responds to:
+    #   engagement_index = (beta+gamma) / (alpha+theta)   – high → high load
+    #   theta_beta_ratio = theta / beta                   – high → fatigue/overload
+    #   rel_alpha                                          – high → relaxed
+    #
+    # The modes are tuned so that with a symmetric baseline (mean=0.5, std=0.25)
+    # they produce clearly separated normalised load categories:
+    #   relaxed   → raw ≈ 0.01  → normalised ≈ 0.13  → LOW
+    #   overloaded → raw ≈ 1.0  → normalised ≈ 0.88  → HIGH
+    #   fatigued  → raw ≈ 0.50  → normalised ≈ 0.50  → MEDIUM
+    #   focused   → raw ≈ 1.0  → normalised ≈ 0.88   → HIGH (high-engagement variant)
+    SIMULATOR_MODES: dict = {
+        "relaxed": {
+            # Pure alpha (8–13 Hz): resting, receptive state.
+            # → Very high rel_alpha, near-zero engagement_index and theta_beta_ratio.
+            # → raw_load ≈ 0.01  →  normalised LOW  →  verbosity=high, tone=engaged
+            "freqs": [11.0, 12.0, 10.5, 11.5],
+            "amps":  [15e-6, 12e-6, 14e-6, 13e-6],
+            "noise":  1e-6,
+        },
+        "focused": {
+            # Pure beta (13–30 Hz): sustained attention, high engagement.
+            # → Very high engagement_index, near-zero rel_alpha.
+            # → raw_load ≈ 1.0  →  normalised HIGH  →  verbosity=low, tone=high_load
+            "freqs": [16.0, 20.0, 14.0, 18.0],
+            "amps":  [ 9e-6, 10e-6,  8e-6, 11e-6],
+            "noise":  3e-6,
+        },
+        "overloaded": {
+            # Pure high-beta / gamma (18–28 Hz): cognitive overload.
+            # → Extreme engagement_index, near-zero rel_alpha and theta_beta_ratio.
+            # → raw_load ≈ 1.0  →  normalised HIGH  →  verbosity=low, tone=high_load
+            "freqs": [20.0, 25.0, 22.0, 18.0],
+            "amps":  [ 8e-6,  9e-6,  7e-6, 10e-6],
+            "noise":  5e-6,
+        },
+        "fatigued": {
+            # Mixed theta (5–7 Hz) + alpha (11 Hz) + low-beta (15 Hz): mental fatigue.
+            # → Moderate engagement_index, moderate theta_beta_ratio, low rel_alpha.
+            # → raw_load ≈ 0.50  →  normalised MEDIUM  →  verbosity=medium
+            "freqs": [ 6.0, 15.0,  7.0, 11.0],
+            "amps":  [15e-6, 12e-6, 14e-6,  8e-6],
+            "noise":  2e-6,
+        },
+    }
+
     def __init__(
         self,
         config: EEGChannelConfig,
@@ -41,6 +93,40 @@ class EEGReader:
         self._task: Optional[asyncio.Task[None]] = None
         self._queue: asyncio.Queue[EEGFrame] = asyncio.Queue(maxsize=4)
         self._running = asyncio.Event()
+
+        # Simulator state — fixed initial phases so each channel produces a
+        # *coherent* oscillation (phase-continuous across samples) and the FFT
+        # correctly resolves spectral peaks in the intended frequency bands.
+        n = len(config.eeg_channels)
+        self._channel_phases = self._rng.uniform(0, 2 * np.pi, size=n)
+        self._base_freqs = np.array([10.0, 20.0, 6.0, 12.0])[:n]
+        self._sim_amplitudes = np.full(n, 10e-6, dtype=float)
+        self._sim_noise_std: float = 2e-6
+
+    def set_mode(self, mode: str) -> None:
+        """Switch simulator EEG spectral profile (no-op on real hardware).
+
+        Calling this mid-session changes the dominant frequency mix so the
+        cognitive model will infer a different load level within a few frames.
+
+        Args:
+            mode: One of "relaxed", "focused", "overloaded", "fatigued".
+        """
+        if not self._use_simulator:
+            logger.warning("set_mode() ignored — running on real hardware.")
+            return
+        params = self.SIMULATOR_MODES.get(mode)
+        if params is None:
+            raise ValueError(
+                f"Unknown simulator mode '{mode}'. "
+                f"Choose from: {list(self.SIMULATOR_MODES)}"
+            )
+        n = len(self._config.eeg_channels)
+        self._base_freqs = np.array(params["freqs"])[:n]
+        self._sim_amplitudes = np.array(params["amps"])[:n]
+        self._sim_noise_std = float(params["noise"])
+        # Re-randomise phases on mode switch so the transition is clean.
+        self._channel_phases = self._rng.uniform(0, 2 * np.pi, size=n)
 
     async def __aenter__(self) -> "EEGReader":
         await self.start()
@@ -117,7 +203,8 @@ class EEGReader:
     async def _simulate(self, window_samples: int, step_samples: int) -> None:
         dt = 1.0 / self._config.sampling_rate
         t = 0.0
-        buffer = self._rng.normal(0, 1e-6, size=(len(self._config.eeg_channels), window_samples))
+        n_ch = len(self._config.eeg_channels)
+        buffer = self._rng.normal(0, 1e-6, size=(n_ch, window_samples))
         while self._running.is_set():
             await asyncio.sleep(self._config.step_size_seconds)
             samples = []
@@ -133,10 +220,16 @@ class EEGReader:
             await self._queue.put(frame)
 
     def _generate_sample(self, t: float) -> np.ndarray:
-        base_freqs = np.array([10.0, 20.0, 6.0, 12.0])[: len(self._config.eeg_channels)]
-        phases = self._rng.uniform(0, 2 * np.pi, size=len(self._config.eeg_channels))
-        oscillations = np.sin(2 * np.pi * base_freqs * t + phases) * 10e-6
-        noise = self._rng.normal(0.0, 2e-6, size=len(self._config.eeg_channels))
+        """Generate one time-step of simulated EEG.
+
+        Uses *persistent* per-channel phases so the oscillation is coherent
+        across samples and the FFT correctly resolves spectral peaks.
+        """
+        oscillations = (
+            np.sin(2 * np.pi * self._base_freqs * t + self._channel_phases)
+            * self._sim_amplitudes
+        )
+        noise = self._rng.normal(0.0, self._sim_noise_std, size=len(self._config.eeg_channels))
         return oscillations + noise
 
 
