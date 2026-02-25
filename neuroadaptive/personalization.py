@@ -60,6 +60,10 @@ class PersonalizationManager:
         self._last_directive: Optional[DirectiveContext] = None
         self._last_raw_load: Optional[float] = None
         self._last_timestamp: Optional[float] = None
+        # Tracks when an adaptation was last *applied* (not suppressed).
+        # Kept separate so the cadence guard correctly enforces a minimum interval
+        # between actual directive changes, not between processing frames.
+        self._last_applied_timestamp: Optional[float] = None
 
     @property
     def baseline_ready(self) -> bool:
@@ -92,6 +96,10 @@ class PersonalizationManager:
         self._last_directive = directive
         self._last_raw_load = raw_load
         self._last_timestamp = timestamp
+        # Update applied-directive timestamp only when we are NOT suppressing,
+        # so the cadence guard measures time since the last actual change.
+        if not suppress:
+            self._last_applied_timestamp = timestamp
         return directive
 
     def _categorize(self, normalized_load: float) -> str:
@@ -112,9 +120,33 @@ class PersonalizationManager:
     def _should_suppress(self, timestamp: float, confidence: float) -> bool:
         if confidence < 0.3:
             return True
-        if self._last_directive and (timestamp - self._last_directive.timestamp) < self._config.min_directive_interval_seconds:
+        if (
+            self._last_applied_timestamp is not None
+            and (timestamp - self._last_applied_timestamp) < self._config.min_directive_interval_seconds
+        ):
             return True
         return False
+
+    def preset_demo_baseline(self, mean: float = 0.5, std: float = 0.25) -> None:
+        """Pre-populate the baseline statistics for demo / scripted runs.
+
+        Bypasses the warmup phase so directive personalisation is active from
+        the first message.  The preset values produce a symmetric normalisation
+        window centred on 0.5 with ±2σ covering roughly the full [0, 1] range.
+
+        Also resets the cadence-guard timer so the first directive is never
+        suppressed due to a stale timestamp.
+
+        Only call this in demo/test contexts — real sessions should collect a
+        genuine resting-state baseline via `calibrate()` or natural warmup.
+        """
+        required = max(1, int(self._config.baseline_duration_seconds / self._step_size))
+        count = max(required + 1, 100)
+        variance = std ** 2
+        self._baseline_stats._count = count
+        self._baseline_stats._mean = mean
+        self._baseline_stats._m2 = variance * (count - 1)
+        self._last_applied_timestamp = None
 
     def baseline_summary(self) -> dict[str, float]:
         return self._baseline_stats.summary()
